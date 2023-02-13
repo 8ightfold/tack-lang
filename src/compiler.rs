@@ -11,6 +11,7 @@ use crate::{
 	lexer::Operator,
 	parser::{
 		BuiltInType, Expression, ExpressionKind, Function, Scope, Statement, StatementKind, Type,
+		TypeRef,
 	},
 };
 
@@ -42,6 +43,7 @@ impl Type {
 				.iter()
 				.map(|field| ast.get_type_size(field.ty))
 				.sum(),
+			Type::Array(inner, size) => ast.get_type_size(*inner) * size,
 		}
 	}
 	pub fn aligned_size(&self, ast: &AST) -> usize {
@@ -163,6 +165,13 @@ impl Compiler {
 		id
 	}
 
+	fn allocate_variable(&self, ty: TypeRef) -> i32 {
+		let size = self.ast.get_type_size(ty);
+		let offset = self.var_counter.get() + size as i32;
+		self.var_counter.set(offset);
+		offset
+	}
+
 	fn compile_scope(&self, scope: Rc<Scope>, function: &Function) {
 		for statement in &scope.statements {
 			self.compile_statement(&statement.borrow(), function);
@@ -258,10 +267,7 @@ impl Compiler {
 
 				let lhs_size = self.ast.get_type_size(exp.children[0].value_type);
 
-				if matches!(
-					self.ast.get_type(exp.children[0].value_type).as_ref(),
-					Type::Struct(_)
-				) {
+				if self.ast.is_struct_or_array(exp.children[0].value_type) {
 					self.copy_memory("eax", "ecx", "edx", lhs_size);
 				} else {
 					match lhs_size {
@@ -273,9 +279,7 @@ impl Compiler {
 				}
 			}
 			ExpressionKind::Declaration(ref var) => {
-				let size = self.ast.get_type_size(var.ty);
-				let val = self.var_counter.get() + size as i32;
-				self.var_counter.set(val);
+				let val = self.allocate_variable(var.ty);
 				self.variables.borrow_mut().insert(var.name.clone(), val);
 				self.write(format!("lea eax, [ebp - {}]", val));
 			}
@@ -465,7 +469,7 @@ impl Compiler {
 			ExpressionKind::Call(ref name) => {
 				for child in &exp.children {
 					self.compile_expression(child, function);
-					if self.ast.is_struct(child.value_type) {
+					if self.ast.is_struct_or_array(child.value_type) {
 						let size = self.ast.get_type_size(child.value_type);
 						self.write(format!(
 							"sub esp, {}",
@@ -485,9 +489,7 @@ impl Compiler {
 
 				let mut struct_offset = 0;
 				if func.is_struct_return {
-					let size = self.ast.get_type_size(func.return_type);
-					struct_offset = self.var_counter.get() + size as i32;
-					self.var_counter.set(struct_offset);
+					struct_offset = self.allocate_variable(func.return_type);
 
 					// cheat and just put a pointer to this on eax
 					self.write(format!("lea eax, [ebp - {}]", struct_offset));
@@ -525,9 +527,7 @@ impl Compiler {
 				let index = lits.len();
 				lits.push(str.clone());
 
-				let size = self.ast.get_type_size(exp.value_type);
-				let offset = self.var_counter.get() + size as i32;
-				self.var_counter.set(offset);
+				let offset = self.allocate_variable(exp.value_type);
 
 				self.write(format!("lea eax, [_str{}]", index));
 				self.write(format!("mov [ebp - {}], eax", offset));
@@ -538,6 +538,30 @@ impl Compiler {
 				));
 				// cheat and just put a pointer to this on eax
 				self.write(format!("lea eax, [ebp - {}]", offset));
+			}
+			ExpressionKind::ArrayLiteral => {
+				let stack_offset = self.allocate_variable(exp.value_type);
+
+				let size = self.ast.get_type_size(exp.children[0].value_type);
+				for (i, child) in exp.children.iter().enumerate() {
+					self.compile_expression(child, function);
+					self.write(format!(
+						"mov [ebp - {}], eax",
+						stack_offset - (i * size) as i32
+					));
+				}
+
+				self.write(format!("lea eax, [ebp - {}]", stack_offset));
+			}
+			ExpressionKind::ArrayIndex => {
+				self.compile_expression(&exp.children[0], function);
+				self.write("push eax");
+				self.compile_expression(&exp.children[1], function);
+				self.write(format!(
+					"imul eax, {}",
+					self.ast.get_type_size(exp.value_type)
+				));
+				self.write("lea eax, [ecx + eax]");
 			}
 			ref k => {
 				todo!("expression {:?}", k);
